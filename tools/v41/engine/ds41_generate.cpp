@@ -1067,6 +1067,21 @@ int main(int argc, char ** argv) {
         const bool park_on = !(std::getenv("STRATA_SERVE_PARK") && std::getenv("STRATA_SERVE_PARK")[0] == '0');
         const int park_min = std::getenv("STRATA_SERVE_PARK_MIN") ? std::atoi(std::getenv("STRATA_SERVE_PARK_MIN")) : 2048;
         const int64_t park_max = std::getenv("STRATA_SERVE_PARK_MAX") ? std::atoll(std::getenv("STRATA_SERVE_PARK_MAX")) : 65536;
+        // STRATA_SERVE_PARK_FLOOR (default 8192): the window a parked conversation reserves for the side requests that
+        // FOLLOW it, not only for the one that triggered the park.  An agent harness sends several of them between two
+        // turns: s1 2026-10-17 a 1,013-token title call parked the 92,792-token conversation with the 1,125 positions
+        // THAT call needs, the next call (5,188 tokens) fell past that window, drop_park() threw the cache away, and
+        // the main turn re-read 94,320 tokens: 250.71 s (the log: "park dropped (request reaches past 1125
+        // positions)" -> "prompt=94320 -> reused=0").  Widening the window is nearly free: park() copies the snapshot
+        // rings whole whatever this is, and only the compressor caches grow with it (~16 KiB a position, so 8192 is
+        // ~130 MB on a 1 TB box).  0 = the old behaviour: the window of the one request that triggered the park.
+        static const int64_t park_floor = std::getenv("STRATA_SERVE_PARK_FLOOR")
+            ? std::atoll(std::getenv("STRATA_SERVE_PARK_FLOOR")) : 8192;
+        // STRATA_SERVE_PREFIX_TAIL (default on, =0 the old way): reuse when the prompt is a PREFIX of the live
+        // conversation, not only when it continues it (see the reuse chain above).
+        const bool prefix_tail = !(std::getenv("STRATA_SERVE_PREFIX_TAIL") && std::getenv("STRATA_SERVE_PREFIX_TAIL")[0] == '0');
+        // the floor for that: the park path's threshold (a request below it is an unrelated side call, and the
+        // park branch must handle it).  Computed per request, next to the lcp scan.
         std::vector<int> park_hist;       // the parked conversation's tokens (its snapshot length)
         std::vector<float> park_logits;
         int64_t park_rows = 0;            // positions saved: a request writing past this invalidates the park
@@ -1121,6 +1136,9 @@ int main(int argc, char ** argv) {
             }
             size_t lcp = 0;
             while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
+            // STRATA_SERVE_PREFIX_TAIL: is this request the SAME conversation (worth resuming) or an unrelated side
+            // call (worth parking)?  The park path answers the same question for the parked one with 3/4 of it.
+            const size_t pt_min = (size_t) std::max<int64_t>(park_min, (int64_t) hist.size() * 3 / 4);
             bool unparked = false;
             int reuse_override = -1;   // a partial unpark: resume at the longest common prefix (see below)
             size_t lp_show = 0;        // how far this request actually continues the PARKED conversation (logged)
@@ -1177,9 +1195,35 @@ int main(int argc, char ** argv) {
             } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);
                 reused = snap_len;
+            }
+            // STRATA_SERVE_PREFIX_TAIL (default on): resume at the longest common prefix even when the prompt does
+            // NOT continue the live conversation to its end.  An agent harness re-sends the conversation shorter than
+            // the engine kept it - a client that ABORTS a generation re-sends the prompt without the aborted tail, a
+            // history compression rewrites its middle, a chat template re-renders its tail - and the live KV positions
+            // [0, lcp) are exactly that prompt.  Requiring lcp == hist.size() (an exact CONTINUATION) threw the whole
+            // cache away: s1 2026-10-17 "reuse lcp=81855 hist=83850 prompt=82199 -> reused=0" re-read 82,199 tokens
+            // in 225.56 s, and a compression (lcp=25983 prompt=81002) 216.57 s.  Resuming BELOW the end of the cache
+            // is the partial-unpark mechanism two branches above (every pass / batch is given its position, the stale
+            // tail is overwritten), and the snapshot logits no longer describe this prompt's end, so snap_len is
+            // dropped exactly as a partial unpark drops it.
+            //   * the threshold is the park path's own (>= 3/4 of the conversation, >= STRATA_SERVE_PARK_MIN): below
+            //     it this is an UNRELATED request (a title / summary call shares ~27 tokens) and the branch above
+            //     must get its chance to PARK the conversation, which is what keeps the main turn cheap.
+            //   * a prompt that ENDS at the reuse point needs its last row re-fed: with delta 0 no forward pass runs
+            //     and last_logits would be the PREVIOUS request's last row (measured: the first sampled token came
+            //     from position 8499 while the prompt ended at 7999).  Reuse one token less and the last token is
+            //     re-fed by the DSpark tail / the step path, which is exact and costs one token.
+            else if (prefix_tail && !unparked && !hist.empty() && lcp >= pt_min && lcp < hist.size()) {
+                hist.resize(lcp);
+                snap_len = -1;
+                reused = (int) lcp - (lcp == ids.size() ? 1 : 0);
+#if defined(DS41_HAVE_DSPARK)
+                dsp_next = -1;        // the window holds the aborted request's states
+#endif
             } else {
                 // an unrelated request: park the conversation it would overwrite (see STRATA_SERVE_PARK)
-                const int64_t rows = (int64_t) ids.size() + (max_new > 0 ? max_new : park_max) + 64;
+                int64_t rows = (int64_t) ids.size() + (max_new > 0 ? max_new : park_max) + 64;
+                if (rows < park_floor) rows = std::min(park_floor, park_max);   // the window for the NEXT side call
                 if (park_on && !dense.parked() && snap_len >= park_min && hist.size() >= (size_t) snap_len && rows <= park_max
                     && dense.park(rows)) {
                     park_hist.assign(hist.begin(), hist.begin() + snap_len);
